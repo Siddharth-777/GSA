@@ -103,3 +103,22 @@ Immediate next milestones:
 ---
 
 If you are collaborating on this repository, please keep contributions aligned to the two challenge tracks above.
+
+## FastAPI Demo Endpoint
+A simple FastAPI app is available in `main.py` with Swagger UI support.
+
+### Endpoint
+- `POST /submit`
+- Request body fields:
+  - `text` (string)
+  - `secret_key` (string)
+
+The endpoint validates `secret_key` against `SECRET_KEY` from `.env`.
+
+### Run locally
+```bash
+uvicorn main:app --reload
+```
+
+Then open:
+- Swagger UI: `http://127.0.0.1:8000/docs`
