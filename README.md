@@ -76,7 +76,17 @@ Create `.env` with:
 
 ```bash
 SECRET_KEY=your_api_key_here
+SUPABASE_URL=https://<project-ref>.supabase.co
+SUPABASE_SERVICE_ROLE_KEY=your_service_role_key
+SUPABASE_BUCKET=your_bucket_name
+# optional override (default: honeypot_first_hits)
+SUPABASE_FIRST_HIT_TABLE=honeypot_first_hits
 ```
+
+> Supabase integration is optional at runtime, but when configured the API stores:
+> - full incoming conversation payload as JSON under `conversations/<sessionId>/...`
+> - final API output as JSON under `outputs/<sessionId>/...`
+> - first-hit registration row in `honeypot_first_hits` for first-message timing
 
 ## Run Locally
 ```bash
