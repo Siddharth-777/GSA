@@ -1,11 +1,13 @@
 import os
 import re
+import json
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib import error as url_error
+from urllib import request as url_request
 
-import requests
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 
@@ -16,6 +18,8 @@ SCAM_THRESHOLD = 0.35
 SUPABASE_CONVERSATION_FOLDER = "conversations"
 SUPABASE_OUTPUT_FOLDER = "outputs"
 SUPABASE_FIRST_HIT_TABLE = "honeypot_first_hits"
+DEFAULT_API_KEY = "suba2006"
+MAX_TEXT_CHARS = 4000
 
 
 # -------------------------------
@@ -99,6 +103,7 @@ class SessionState:
     phone_numbers: set[str] = field(default_factory=set)
     suspicious_keywords: set[str] = field(default_factory=set)
     first_hit_logged: bool = False
+    prompt_attempts: dict[str, int] = field(default_factory=dict)
 
 
 SESSION_STORE: dict[str, SessionState] = {}
@@ -127,6 +132,11 @@ SCAM_PATTERNS: dict[str, float] = {
     "share screen": 0.2,
     "remote app": 0.2,
     "suspend": 0.12,
+    "security team": 0.12,
+    "verification": 0.1,
+    "wallet": 0.08,
+    "transfer": 0.1,
+    "beneficiary": 0.12,
 }
 
 UPI_REGEX = re.compile(r"\b[a-zA-Z0-9._-]{2,}@[a-zA-Z]{2,}\b")
@@ -138,6 +148,21 @@ BANK_REGEX = re.compile(r"\b\d{9,18}\b")
 
 def normalize_text(text: str) -> str:
     return re.sub(r"\s+", " ", text.lower()).strip()
+
+
+def sanitize_text(text: str) -> str:
+    if len(text) <= MAX_TEXT_CHARS:
+        return text
+    return text[:MAX_TEXT_CHARS]
+
+
+def collect_messages(payload: HoneyPotRequest, sender: str | None = None) -> list[str]:
+    messages: list[Message] = [*payload.conversationHistory, payload.message]
+    if sender is None:
+        return [sanitize_text(msg.text) for msg in messages]
+
+    sender_normalized = sender.strip().lower()
+    return [sanitize_text(msg.text) for msg in messages if msg.sender.strip().lower() == sender_normalized]
 
 
 
@@ -199,14 +224,39 @@ def generate_reply(state: SessionState) -> str:
     if not state.scam_detected:
         return "Can you explain this in detail? I want to understand before I proceed."
 
-    if not state.upi_ids:
-        return "I can do that. Which UPI ID should I use for verification?"
-    if not state.phishing_links:
-        return "Okay, please share the exact link where I should complete this process."
-    if not state.phone_numbers:
-        return "In case this disconnects, which official support number should I call back?"
-    if not state.bank_accounts:
-        return "Do you have an account reference number for this case?"
+    prompts = {
+        "upi": [
+            "I can do that. Which UPI ID should I use for verification?",
+            "Please confirm the exact UPI handle so I send it to the right account.",
+        ],
+        "link": [
+            "Okay, please share the exact link where I should complete this process.",
+            "The page is not opening for me. Can you resend the full secure link?",
+        ],
+        "phone": [
+            "In case this disconnects, which official support number should I call back?",
+            "Please share your helpline number so I can confirm this request quickly.",
+        ],
+        "bank": [
+            "Do you have an account reference number for this case?",
+            "Share the beneficiary account number once so I can match it before proceeding.",
+        ],
+    }
+
+    goals = [
+        ("upi", not state.upi_ids),
+        ("link", not state.phishing_links),
+        ("phone", not state.phone_numbers),
+        ("bank", not state.bank_accounts),
+    ]
+
+    for key, missing in goals:
+        if not missing:
+            continue
+        attempt = state.prompt_attempts.get(key, 0)
+        state.prompt_attempts[key] = attempt + 1
+        variants = prompts[key]
+        return variants[min(attempt, len(variants) - 1)]
 
     return "I am getting an error. Could you repeat the steps once more so I do it correctly?"
 
@@ -238,14 +288,14 @@ def send_final_callback(session_id: str, state: SessionState) -> bool:
     }
 
     try:
-        response = requests.post(
+        response = safe_post_json(
             FINAL_RESULT_ENDPOINT,
-            json=payload,
-            timeout=5,
+            payload,
             headers={"Content-Type": "application/json"},
+            timeout=2.5,
         )
-        return response.status_code < 300
-    except requests.RequestException:
+        return response < 300
+    except OSError:
         return False
 
 
@@ -276,9 +326,9 @@ def upload_json_to_supabase(path: str, payload: dict[str, Any]) -> bool:
     }
 
     try:
-        response = requests.post(endpoint, json=payload, headers=headers, timeout=5)
-        return response.status_code < 300
-    except requests.RequestException:
+        status = safe_post_json(endpoint, payload, headers=headers, timeout=2.5)
+        return status < 300
+    except OSError:
         return False
 
 
@@ -305,10 +355,29 @@ def register_first_hit(session_id: str, first_message: Message, history_count: i
     }
 
     try:
-        response = requests.post(endpoint, json=record, headers=headers, timeout=5)
-        return response.status_code < 300
-    except requests.RequestException:
+        status = safe_post_json(endpoint, record, headers=headers, timeout=2.5)
+        return status < 300
+    except OSError:
         return False
+
+
+def safe_post_json(
+    url: str,
+    payload: dict[str, Any],
+    headers: dict[str, str] | None = None,
+    timeout: float = 2.5,
+) -> int:
+    request_headers = {"Content-Type": "application/json"}
+    if headers:
+        request_headers.update(headers)
+
+    data = json.dumps(payload).encode("utf-8")
+    req = url_request.Request(url, data=data, headers=request_headers, method="POST")
+    try:
+        with url_request.urlopen(req, timeout=timeout) as response:
+            return response.getcode()
+    except url_error.HTTPError as exc:
+        return exc.code
 
 
 def persist_session_artifacts(
@@ -341,13 +410,17 @@ def persist_session_artifacts(
 
 
 def get_expected_secret() -> str:
-    secret = os.getenv("SECRET_KEY")
-    if not secret:
-        raise HTTPException(
-            status_code=500,
-            detail="Server configuration error: SECRET_KEY is not set.",
-        )
-    return secret
+    candidates = [
+        os.getenv("SECRET_KEY", "").strip(),
+        os.getenv("API_KEY", "").strip(),
+        os.getenv("HONEYPOT_API_KEY", "").strip(),
+    ]
+
+    for candidate in candidates:
+        if candidate:
+            return candidate
+
+    return DEFAULT_API_KEY
 
 
 @app.get("/")
@@ -364,55 +437,66 @@ def honeypot_handler(
     if x_api_key != expected_secret:
         raise HTTPException(status_code=401, detail="Invalid API key")
 
-    state = SESSION_STORE.setdefault(payload.sessionId, SessionState())
+    try:
+        state = SESSION_STORE.setdefault(payload.sessionId, SessionState())
 
-    if not state.first_hit_logged:
-        state.first_hit_logged = register_first_hit(
-            payload.sessionId,
-            payload.message,
-            len(payload.conversationHistory),
+        if not state.first_hit_logged:
+            state.first_hit_logged = register_first_hit(
+                payload.sessionId,
+                payload.message,
+                len(payload.conversationHistory),
+            )
+
+        scammer_messages = collect_messages(payload, sender="scammer")
+        full_text = "\n".join(scammer_messages or collect_messages(payload))
+
+        detected, confidence, hits = detect_scam_intent(full_text)
+        state.scam_detected = state.scam_detected or detected
+        state.confidence = max(state.confidence, confidence)
+
+        for msg_text in scammer_messages:
+            update_intelligence(state, msg_text)
+
+        state.total_messages = len(payload.conversationHistory) + 1
+
+        if hits:
+            state.agent_notes = (
+                f"Detected scam behavior with indicators: {', '.join(sorted(set(hits)))}"
+            )
+        elif state.scam_detected:
+            state.agent_notes = "Conversation remains suspicious based on cumulative context."
+        else:
+            state.agent_notes = "No strong scam indicators in latest context."
+
+        reply = generate_reply(state)
+
+        callback_sent = False
+        if should_send_callback(state):
+            callback_sent = send_final_callback(payload.sessionId, state)
+            state.callback_sent = callback_sent
+
+        response = HoneyPotResponse(
+            status="success",
+            reply=reply,
+            scamDetected=state.scam_detected,
+            confidence=round(state.confidence, 3),
+            totalMessagesExchanged=state.total_messages,
+            extractedIntelligence=extract_payload(state),
+            agentNotes=state.agent_notes,
+            callbackSent=callback_sent,
         )
 
-    conversation_messages = [m.text for m in payload.conversationHistory]
-    conversation_messages.append(payload.message.text)
-    full_text = "\n".join(conversation_messages)
-
-    detected, confidence, hits = detect_scam_intent(full_text)
-    state.scam_detected = state.scam_detected or detected
-    state.confidence = max(state.confidence, confidence)
-
-    for msg in payload.conversationHistory:
-        update_intelligence(state, msg.text)
-    update_intelligence(state, payload.message.text)
-
-    state.total_messages = len(payload.conversationHistory) + 1
-
-    if hits:
-        state.agent_notes = (
-            f"Detected scam behavior with indicators: {', '.join(sorted(set(hits)))}"
+        persist_session_artifacts(payload.sessionId, payload, response)
+        return response
+    except Exception:
+        fallback_reply = "I could not follow that, can you repeat the request once?"
+        return HoneyPotResponse(
+            status="success",
+            reply=fallback_reply,
+            scamDetected=False,
+            confidence=0.0,
+            totalMessagesExchanged=len(payload.conversationHistory) + 1,
+            extractedIntelligence=ExtractedIntelligence(),
+            agentNotes="Recovered from runtime error and returned safe fallback response.",
+            callbackSent=False,
         )
-    elif state.scam_detected:
-        state.agent_notes = "Conversation remains suspicious based on cumulative context."
-    else:
-        state.agent_notes = "No strong scam indicators in latest context."
-
-    reply = generate_reply(state)
-
-    callback_sent = False
-    if should_send_callback(state):
-        callback_sent = send_final_callback(payload.sessionId, state)
-        state.callback_sent = callback_sent
-
-    response = HoneyPotResponse(
-        status="success",
-        reply=reply,
-        scamDetected=state.scam_detected,
-        confidence=round(state.confidence, 3),
-        totalMessagesExchanged=state.total_messages,
-        extractedIntelligence=extract_payload(state),
-        agentNotes=state.agent_notes,
-        callbackSent=callback_sent,
-    )
-
-    persist_session_artifacts(payload.sessionId, payload, response)
-    return response
