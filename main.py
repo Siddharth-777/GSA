@@ -143,6 +143,13 @@ UPI_REGEX = re.compile(r"\b[a-zA-Z0-9._-]{2,}@[a-zA-Z]{2,}\b")
 URL_REGEX = re.compile(r"https?://[^\s]+", re.IGNORECASE)
 PHONE_REGEX = re.compile(r"(?:\+91[-\s]?)?[6-9]\d{9}\b")
 BANK_REGEX = re.compile(r"\b\d{9,18}\b")
+META_REASONING_MARKERS = (
+    "the user wants",
+    "instructions:",
+    "output only",
+    "we need to output",
+    "scenario:",
+)
 
 
 
@@ -156,13 +163,37 @@ def sanitize_text(text: str) -> str:
     return text[:MAX_TEXT_CHARS]
 
 
+def clean_scammer_text(text: str) -> str:
+    cleaned_lines: list[str] = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        normalized = line.lower()
+        if normalized.startswith("scammer") or normalized.startswith("honeypot"):
+            continue
+        if any(marker in normalized for marker in META_REASONING_MARKERS):
+            continue
+
+        cleaned_lines.append(line)
+
+    if cleaned_lines:
+        return "\n".join(cleaned_lines)
+    return text
+
+
 def collect_messages(payload: HoneyPotRequest, sender: str | None = None) -> list[str]:
     messages: list[Message] = [*payload.conversationHistory, payload.message]
     if sender is None:
         return [sanitize_text(msg.text) for msg in messages]
 
     sender_normalized = sender.strip().lower()
-    return [sanitize_text(msg.text) for msg in messages if msg.sender.strip().lower() == sender_normalized]
+    selected = [msg for msg in messages if msg.sender.strip().lower() == sender_normalized]
+    if sender_normalized == "scammer":
+        return [sanitize_text(clean_scammer_text(msg.text)) for msg in selected]
+
+    return [sanitize_text(msg.text) for msg in selected]
 
 
 
@@ -194,13 +225,18 @@ def detect_scam_intent(text: str) -> tuple[bool, float, list[str]]:
 
 def update_intelligence(state: SessionState, text: str) -> None:
     lowered = normalize_text(text)
+
+    phone_matches = {match.strip() for match in PHONE_REGEX.findall(text)}
+
     for token in UPI_REGEX.findall(text):
         state.upi_ids.add(token)
     for token in URL_REGEX.findall(text):
         state.phishing_links.add(token)
-    for token in PHONE_REGEX.findall(text):
-        state.phone_numbers.add(token.strip())
+    for token in phone_matches:
+        state.phone_numbers.add(token)
     for token in BANK_REGEX.findall(text):
+        if any(token in phone or phone.endswith(token) for phone in phone_matches):
+            continue
         state.bank_accounts.add(token)
 
     for keyword in SCAM_PATTERNS:
