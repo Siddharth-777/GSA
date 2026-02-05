@@ -1,5 +1,6 @@
 import os
 import re
+from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -12,6 +13,9 @@ app = FastAPI(title="GSA API", version="2.0.0", docs_url="/gsa")
 
 FINAL_RESULT_ENDPOINT = "https://hackathon.guvi.in/api/updateHoneyPotFinalResult"
 SCAM_THRESHOLD = 0.35
+SUPABASE_CONVERSATION_FOLDER = "conversations"
+SUPABASE_OUTPUT_FOLDER = "outputs"
+SUPABASE_FIRST_HIT_TABLE = "honeypot_first_hits"
 
 
 # -------------------------------
@@ -94,6 +98,7 @@ class SessionState:
     phishing_links: set[str] = field(default_factory=set)
     phone_numbers: set[str] = field(default_factory=set)
     suspicious_keywords: set[str] = field(default_factory=set)
+    first_hit_logged: bool = False
 
 
 SESSION_STORE: dict[str, SessionState] = {}
@@ -244,6 +249,96 @@ def send_final_callback(session_id: str, state: SessionState) -> bool:
         return False
 
 
+def get_supabase_settings() -> dict[str, str] | None:
+    url = os.getenv("SUPABASE_URL", "").strip().rstrip("/")
+    key = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
+    bucket = os.getenv("SUPABASE_BUCKET", "").strip()
+
+    if not url or not key or not bucket:
+        return None
+
+    return {"url": url, "key": key, "bucket": bucket}
+
+
+def upload_json_to_supabase(path: str, payload: dict[str, Any]) -> bool:
+    settings = get_supabase_settings()
+    if not settings:
+        return False
+
+    endpoint = (
+        f"{settings['url']}/storage/v1/object/{settings['bucket']}/{path.lstrip('/')}"
+    )
+    headers = {
+        "apikey": settings["key"],
+        "Authorization": f"Bearer {settings['key']}",
+        "Content-Type": "application/json",
+        "x-upsert": "true",
+    }
+
+    try:
+        response = requests.post(endpoint, json=payload, headers=headers, timeout=5)
+        return response.status_code < 300
+    except requests.RequestException:
+        return False
+
+
+def register_first_hit(session_id: str, first_message: Message, history_count: int) -> bool:
+    settings = get_supabase_settings()
+    if not settings:
+        return False
+
+    table = os.getenv("SUPABASE_FIRST_HIT_TABLE", SUPABASE_FIRST_HIT_TABLE).strip()
+    endpoint = f"{settings['url']}/rest/v1/{table}"
+    headers = {
+        "apikey": settings["key"],
+        "Authorization": f"Bearer {settings['key']}",
+        "Content-Type": "application/json",
+        "Prefer": "return=minimal",
+    }
+
+    record = {
+        "session_id": session_id,
+        "first_message_timestamp": first_message.timestamp,
+        "first_message_received_at": datetime.now(timezone.utc).isoformat(),
+        "first_message_sender": first_message.sender,
+        "history_count_on_first_hit": history_count,
+    }
+
+    try:
+        response = requests.post(endpoint, json=record, headers=headers, timeout=5)
+        return response.status_code < 300
+    except requests.RequestException:
+        return False
+
+
+def persist_session_artifacts(
+    session_id: str,
+    payload: HoneyPotRequest,
+    response_payload: HoneyPotResponse,
+) -> tuple[bool, bool]:
+    event_timestamp = payload.message.timestamp
+
+    conversation_blob = {
+        "sessionId": session_id,
+        "metadata": payload.metadata.model_dump() if payload.metadata else None,
+        "conversationHistory": [msg.model_dump() for msg in payload.conversationHistory],
+        "latestMessage": payload.message.model_dump(),
+        "savedAt": datetime.now(timezone.utc).isoformat(),
+    }
+    conversation_path = (
+        f"{SUPABASE_CONVERSATION_FOLDER}/{session_id}/{event_timestamp}.json"
+    )
+
+    output_blob = response_payload.model_dump()
+    output_blob["sessionId"] = session_id
+    output_blob["savedAt"] = datetime.now(timezone.utc).isoformat()
+    output_path = f"{SUPABASE_OUTPUT_FOLDER}/{session_id}/{event_timestamp}.json"
+
+    convo_saved = upload_json_to_supabase(conversation_path, conversation_blob)
+    output_saved = upload_json_to_supabase(output_path, output_blob)
+    return convo_saved, output_saved
+
+
 
 def get_expected_secret() -> str:
     secret = os.getenv("SECRET_KEY")
@@ -270,6 +365,13 @@ def honeypot_handler(
         raise HTTPException(status_code=401, detail="Invalid API key")
 
     state = SESSION_STORE.setdefault(payload.sessionId, SessionState())
+
+    if not state.first_hit_logged:
+        state.first_hit_logged = register_first_hit(
+            payload.sessionId,
+            payload.message,
+            len(payload.conversationHistory),
+        )
 
     conversation_messages = [m.text for m in payload.conversationHistory]
     conversation_messages.append(payload.message.text)
@@ -301,7 +403,7 @@ def honeypot_handler(
         callback_sent = send_final_callback(payload.sessionId, state)
         state.callback_sent = callback_sent
 
-    return HoneyPotResponse(
+    response = HoneyPotResponse(
         status="success",
         reply=reply,
         scamDetected=state.scam_detected,
@@ -311,3 +413,6 @@ def honeypot_handler(
         agentNotes=state.agent_notes,
         callbackSent=callback_sent,
     )
+
+    persist_session_artifacts(payload.sessionId, payload, response)
+    return response
