@@ -111,9 +111,10 @@ A simple FastAPI app is available in `main.py` with Swagger UI support.
 - `POST /submit`
 - Request body fields:
   - `text` (string)
-  - `secret_key` (string)
+- Required header:
+  - `X-Secret-Key` (string)
 
-The endpoint validates `secret_key` against `SECRET_KEY` from `.env`.
+The endpoint validates `X-Secret-Key` against `SECRET_KEY` from `.env`.
 
 ### Run locally
 ```bash
@@ -121,4 +122,4 @@ uvicorn main:app --reload
 ```
 
 Then open:
-- Swagger UI: `http://127.0.0.1:8000/docs`
+- Swagger UI: `http://127.0.0.1:8000/gsa`
