@@ -4,6 +4,7 @@ from typing import Optional
 
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
+from supabase import Client, create_client
 
 app = FastAPI(title="GSA API", version="1.0.0", docs_url="/gsa")
 
@@ -48,6 +49,26 @@ def get_expected_secret() -> str:
     return secret
 
 
+def get_supabase_client() -> Client:
+    supabase_url = os.getenv("SUPABASE_URL")
+    supabase_key = os.getenv("SUPABASE_KEY")
+
+    if not supabase_url or not supabase_key:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Server configuration error: SUPABASE_URL and SUPABASE_KEY "
+                "must be set in .env/environment."
+            ),
+        )
+
+    return create_client(supabase_url, supabase_key)
+
+
+def get_supabase_table() -> str:
+    return os.getenv("SUPABASE_TABLE", "user_inputs")
+
+
 @app.get("/")
 def health() -> dict:
     return {"status": "ok", "docs": "/gsa"}
@@ -56,11 +77,22 @@ def health() -> dict:
 @app.post("/submit", response_model=ApiResponse)
 def submit_input(
     payload: UserInput,
-    x_secret_key: str = Header(..., min_length=1, alias="X-Secret-Key"),
+    x_api_key: str = Header(..., min_length=1, alias="x-api-key"),
 ) -> ApiResponse:
     expected_secret = get_expected_secret()
 
-    if x_secret_key != expected_secret:
+    if x_api_key != expected_secret:
         raise HTTPException(status_code=401, detail="Invalid secret key")
+
+    supabase = get_supabase_client()
+    table_name = get_supabase_table()
+
+    try:
+        supabase.table(table_name).insert({"text": payload.text}).execute()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to store input in Supabase: {exc}",
+        ) from exc
 
     return ApiResponse(message="Input accepted", received_text=payload.text)
