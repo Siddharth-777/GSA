@@ -77,11 +77,11 @@ def health() -> dict:
 @app.post("/submit", response_model=ApiResponse)
 def submit_input(
     payload: UserInput,
-    x_secret_key: str = Header(..., min_length=1, alias="X-Secret-Key"),
+    x_api_key: str = Header(..., min_length=1, alias="x-api-key"),
 ) -> ApiResponse:
     expected_secret = get_expected_secret()
 
-    if x_secret_key != expected_secret:
+    if x_api_key != expected_secret:
         raise HTTPException(status_code=401, detail="Invalid secret key")
 
     supabase = get_supabase_client()
