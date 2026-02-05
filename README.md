@@ -112,9 +112,9 @@ A simple FastAPI app is available in `main.py` with Swagger UI support.
 - Request body fields:
   - `text` (string)
 - Required header:
-  - `X-Secret-Key` (string)
+  - `x-api-key` (string)
 
-The endpoint validates `X-Secret-Key` against `SECRET_KEY` from `.env` and stores the submitted `text` in Supabase.
+The endpoint validates `x-api-key` against `SECRET_KEY` from `.env` and stores the submitted `text` in Supabase.
 
 Required environment variables:
 - `SECRET_KEY`
